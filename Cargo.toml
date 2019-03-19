@@ -1,0 +1,9 @@
+[package]
+name = "andross"
+version = "0.1.0"
+authors = ["meta <hosaka-corp@users.noreply.github.com>"]
+edition = "2018"
+
+[dependencies]
+mio = "0.6"
+spmc = "0.2.2"
