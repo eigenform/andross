@@ -16,6 +16,7 @@ use std::io::SeekFrom;
 use byteorder::{ReadBytesExt, BigEndian};
 
 use std::io::prelude::*;
+use std::io::ErrorKind;
 use mio::{Events, Poll, Ready, PollOpt, Token};
 
 use mio::net::TcpStream;
@@ -46,10 +47,8 @@ const PRE_FRAME: u8         = 0x37;
 const POST_FRAME: u8        = 0x38; 
 const GAME_END: u8          = 0x39; 
 
-// Hashmap for Slippi commands. Needs lazy evaluation, and also needs to have
-// a static lifetime so we can reference it wherever/whenever. I assume that,
-// because we need to change this later during runtime, this also means we 
-// need to use a Mutex to serialize writes to this :^( 
+// Global HashMap, mapping Slippi commands to their sizes.
+// The console thread writes to this when we parse EVENT_PAYLOADS.
 lazy_static! {
     static ref SLIP_CMD: Mutex<HashMap<u8, u16>> = Mutex::new({
         let mut m = HashMap::new();
@@ -59,6 +58,16 @@ lazy_static! {
         m.insert(GAME_END, 0);
         m
     });
+}
+
+// Set up a global buffer for messages from console
+lazy_static! {
+    static ref GLOBAL_BUF: Mutex<Vec<Vec<u8>>> = Mutex::new(vec![vec![]]);
+}
+
+// Set up a global list of consumer threads 
+lazy_static! {
+    static ref THREAD_LIST: Mutex<Vec<usize>> = Mutex::new(vec![]);
 }
 
 
@@ -114,6 +123,7 @@ fn parse_message(msg: &Vec<u8>) -> usize {
 }
 
 
+
 fn main() {
 
     // Handle command-line arguments from the user
@@ -134,15 +144,7 @@ fn main() {
     // access to this because broadcast() and add_rx() require ownership
     let bus: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
 
-
     let (m_tx, m_rx) = mpsc::sync_channel(0);
-
-    // Need need shared, safe access to the global list of threads 
-    let thread_list: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(vec![]));
-
-    // Set up a global buffer for messages from console
-    let global_buf: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![vec![]]));
-
 
 
 /* Set up the console stream and register with Poll. The connect() call here 
@@ -150,7 +152,6 @@ fn main() {
  * if we failed to connect (and should proceed to just terminate the program).
  */
     // Connect to the console stream
-    //let addr: SocketAddr = "10.200.200.5:666".parse().unwrap();
     let addr: SocketAddr = host.parse().unwrap();
     let mut console_stream = match TcpStream::connect(&addr) {
         Ok(console_stream) => console_stream,
@@ -186,8 +187,6 @@ fn main() {
  * up introducing some extra delay during mirroring.
  */
     let console_bus = bus.clone();
-    let console_buf = global_buf.clone();
-    let consumer_list = thread_list.clone();
     let mut total_msgcount = 0;
 
     thread::spawn(move || {
@@ -210,14 +209,21 @@ fn main() {
 
                     // Read the message into a vector
                     let mut message = vec![];
-                    console_stream.read_to_end(&mut message).unwrap();
+                    match console_stream.read_to_end(&mut message) {
+                        Ok(_)   => {},
+                        Err(y)  => {
+                            if y.kind() != ErrorKind::WouldBlock {
+                                panic!("[console]\tI/O error ({})", y);
+                            }
+                        },
+                    };
                     total_msgcount += 1;
 
                     // Parse Slippi commands within the message
                     let msg = parse_message(&message);
 
                     // Push a new message onto the global buffer
-                    console_buf.lock().unwrap().push(message);
+                    GLOBAL_BUF.lock().unwrap().push(message);
 
                     // Emit a channel message to all consumer threads
                     console_bus.lock().unwrap().broadcast(msg);
@@ -228,7 +234,7 @@ fn main() {
                             println!("[console] Going to clear buffer, waiting...");
 
                             // Acquire lock, get current list of threads
-                            let mut consumers = consumer_list.lock().unwrap().to_vec();
+                            let mut consumers = THREAD_LIST.lock().unwrap().to_vec();
 
                             // Block until all consumers are accounted for
                             while consumers.len() != 0 {
@@ -241,7 +247,7 @@ fn main() {
                             // <impl here...>
 
                             // Free up messages from this session
-                            console_buf.lock().unwrap().clear();
+                            GLOBAL_BUF.lock().unwrap().clear();
                             println!("[console]\tFlushed memory");
                         },
                         _       => {},
@@ -275,15 +281,13 @@ fn main() {
         // Increment the thread ID, push onto list, then make a clone of the
         // thread list (so we can pop an ID off if a client HUPs)
         tid += 1;
-        thread_list.lock().unwrap().push(tid);
-        let thread_list = thread_list.clone();
+        THREAD_LIST.lock().unwrap().push(tid);
 
         let threadname = String::from(format!("consumer-{}", tid));
 
         let mut read_cur = 0;
         let mut rx = bus.lock().unwrap().add_rx();
         let mut stream = TcpStream::from_stream(s.unwrap()).unwrap();
-        let consumer_buf = global_buf.clone();
 
         let tx = m_tx.clone();
 
@@ -298,7 +302,7 @@ fn main() {
                 let state = rx.recv().unwrap();
 
                 // Block until we acquire the lock and unwrap the buffer
-                let buffer = consumer_buf.lock().unwrap();
+                let buffer = GLOBAL_BUF.lock().unwrap();
                 let write_cur = buffer.len();
 
                 // Read and send() until we catch up to the write cursor
@@ -307,10 +311,10 @@ fn main() {
                         Ok(_) => {},
                         Err(y) => {
                             println!("[{}]\tDisconnected ({})", threadname, y);
-                            thread_list.lock().unwrap().retain(|x| x != &tid);
+                            THREAD_LIST.lock().unwrap().retain(|x| x != &tid);
                             println!("[{}] new threadlist: {:?}",
                                      threadname, 
-                                     thread_list.lock().unwrap().iter());
+                                     THREAD_LIST.lock().unwrap().iter());
                             break 'consumer_loop;
                         },
                     };
