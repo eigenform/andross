@@ -13,7 +13,7 @@ use std::process::{exit};
 
 use std::io::Cursor;
 use std::io::SeekFrom;
-use byteorder::{ReadBytesExt, BigEndian, LittleEndian};
+use byteorder::{ReadBytesExt, BigEndian};
 
 use std::io::prelude::*;
 use mio::{Events, Poll, Ready, PollOpt, Token};
@@ -36,10 +36,8 @@ fn timestamp() -> f64 {
 }
 
 // For more complex synchronization between threads
-const SLEEP: usize          = 0x00;
 const UPDATE: usize         = 0xd0;
 const FLUSH: usize          = 0xd1;
-const IGNORE: usize         = 0xd2;
 
 // Slippi commands
 const EVENT_PAYLOADS: u8    = 0x35; 
@@ -71,7 +69,6 @@ fn parse_message(msg: &Vec<u8>) -> usize {
     // Note that, we can't ignore HELO messages and *must* pass them through
     // to clients (otherwise say, the desktop app would time us out).
 
-    let mut cur = 0;
     let mut rdr = Cursor::new(msg);
     println!("[console] Unwrapping message (len=0x{:x})", len);
 
@@ -81,7 +78,7 @@ fn parse_message(msg: &Vec<u8>) -> usize {
             EVENT_PAYLOADS  => {
                 let size = rdr.read_u8().unwrap();
                 let num = (size - 1) / 0x3;
-                for i in 0..num {
+                for _ in 0..num {
                     let k = rdr.read_u8().unwrap();
                     let l = rdr.read_u16::<BigEndian>().unwrap();
                     SLIP_CMD.lock().unwrap().insert(k, l);
@@ -91,23 +88,23 @@ fn parse_message(msg: &Vec<u8>) -> usize {
             GAME_START      => {
                 println!("[console]\tConsumed GAME_START");
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen));
+                rdr.seek(SeekFrom::Current(mlen)).unwrap();
             },
             GAME_END        => {
                 println!("[console]\tConsumed GAME_END");
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen));
+                rdr.seek(SeekFrom::Current(mlen)).unwrap();
                 res = FLUSH;
             },
             PRE_FRAME        => {
                 println!("[console]\tConsumed PRE_FRAME");
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen));
+                rdr.seek(SeekFrom::Current(mlen)).unwrap();
             },
             POST_FRAME        => {
                 println!("[console]\tConsumed POST_FRAME");
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen));
+                rdr.seek(SeekFrom::Current(mlen)).unwrap();
             },
 
             _               => {},
@@ -135,7 +132,7 @@ fn main() {
 
     // Use the 'bus' crate to broadcast on channels; we need to serialize any
     // access to this because broadcast() and add_rx() require ownership
-    let mut bus: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
+    let bus: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
 
 
     let (m_tx, m_rx) = mpsc::sync_channel(0);
@@ -163,14 +160,14 @@ fn main() {
     };
 
     // Register the console stream with poll
-    poll.register(&console_stream, Token(0), Ready::all(), PollOpt::edge());
+    poll.register(&console_stream, Token(0), Ready::all(), PollOpt::edge()).unwrap();
 
      // Check if we connected, otherwise die.
-    poll.poll(&mut events, None);
+    poll.poll(&mut events, None).unwrap();
     for event in &events {
         if event.token() == Token(0) && event.readiness().is_hup() {
             println!("[console]\tCouldn't connect to the console!");
-            console_stream.shutdown(mio::tcp::Shutdown::Both);
+            console_stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
             std::process::exit(-1);
         }
     }
@@ -191,7 +188,6 @@ fn main() {
     let console_bus = bus.clone();
     let console_buf = global_buf.clone();
     let consumer_list = thread_list.clone();
-    let mut msg = UPDATE;
     let mut total_msgcount = 0;
 
     thread::spawn(move || {
@@ -199,7 +195,7 @@ fn main() {
         println!("[console]\tStarted console socket!");
 
         'console_loop: loop {
-            poll.poll(&mut events, None);
+            poll.poll(&mut events, None).unwrap();
             for event in &events {
 
                 // If the socket is readable
@@ -207,14 +203,14 @@ fn main() {
 
                     // If the client hung up, break out of this loop
                     if event.readiness().is_hup() {
-                        console_stream.shutdown(mio::tcp::Shutdown::Both);
+                        console_stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
                         println!("[console]\tThe console hung up our connection.");
                         break 'console_loop;
                     }
 
                     // Read the message into a vector
                     let mut message = vec![];
-                    console_stream.read_to_end(&mut message);
+                    console_stream.read_to_end(&mut message).unwrap();
                     total_msgcount += 1;
 
                     // Parse Slippi commands within the message
@@ -284,7 +280,6 @@ fn main() {
 
         let threadname = String::from(format!("consumer-{}", tid));
 
-        let mut state = SLEEP;
         let mut read_cur = 0;
         let mut rx = bus.lock().unwrap().add_rx();
         let mut stream = TcpStream::from_stream(s.unwrap()).unwrap();
@@ -293,7 +288,7 @@ fn main() {
         let tx = m_tx.clone();
 
         // Use TCP_NODELAY - probably required to *go fast*
-        stream.set_nodelay(true);
+        stream.set_nodelay(true).unwrap();
 
         thread::spawn(move || {
             println!("[{}] Thread spawned for consumer", threadname);
@@ -309,7 +304,7 @@ fn main() {
                 // Read and send() until we catch up to the write cursor
                 while read_cur < write_cur {
                     match stream.write(buffer.get(read_cur).unwrap()) {
-                        Ok(n) => {},
+                        Ok(_) => {},
                         Err(y) => {
                             println!("[{}]\tDisconnected ({})", threadname, y);
                             thread_list.lock().unwrap().retain(|x| x != &tid);
@@ -325,7 +320,7 @@ fn main() {
 
                 match state {
                     FLUSH       => {
-                        tx.send(tid);
+                        tx.send(tid).unwrap();
                         read_cur = 0;
                         println!("[{}]\tSent all-clear to console thread",
                                  threadname);
