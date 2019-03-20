@@ -6,14 +6,8 @@ extern crate byteorder;
 #[macro_use]
 extern crate lazy_static;
 
-use std::collections::HashMap;
-
 use std::env;
 use std::process::{exit};
-
-use std::io::Cursor;
-use std::io::SeekFrom;
-use byteorder::{ReadBytesExt, BigEndian};
 
 use std::io::prelude::*;
 use std::io::ErrorKind;
@@ -28,36 +22,15 @@ use std::sync::{Arc,Mutex};
 use std::sync::mpsc;
 use bus::Bus;
 
+mod slippi;
+
 const MAIN_THREAD_CYCLE: Duration = Duration::from_millis(10);
 
+// Helper function for timing
 fn timestamp() -> f64 {
     let timespec = time::get_time();
     let mills: f64 = timespec.sec as f64 + (timespec.nsec as f64 / 1000.0 / 1000.0 / 1000.0);
     mills
-}
-
-// For more complex synchronization between threads
-const UPDATE: usize         = 0xd0;
-const FLUSH: usize          = 0xd1;
-
-// Slippi commands
-const EVENT_PAYLOADS: u8    = 0x35; 
-const GAME_START: u8        = 0x36; 
-const PRE_FRAME: u8         = 0x37; 
-const POST_FRAME: u8        = 0x38; 
-const GAME_END: u8          = 0x39; 
-
-// Global HashMap, mapping Slippi commands to their sizes.
-// The console thread writes to this when we parse EVENT_PAYLOADS.
-lazy_static! {
-    static ref SLIP_CMD: Mutex<HashMap<u8, u16>> = Mutex::new({
-        let mut m = HashMap::new();
-        m.insert(GAME_START, 0);
-        m.insert(PRE_FRAME, 0);
-        m.insert(POST_FRAME, 0);
-        m.insert(GAME_END, 0);
-        m
-    });
 }
 
 // Set up a global buffer for messages from console
@@ -72,58 +45,8 @@ lazy_static! {
 
 // Channel from console thread to N consumer threads
 lazy_static! {
-    static ref BUS: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
+    static ref BUS: Arc<Mutex<Bus<u8>>> = Arc::new(Mutex::new(Bus::new(32)));
 }
-
-
-fn parse_message(msg: &Vec<u8>) -> usize {
-    let mut res = UPDATE;
-    let len = msg.len() as u64;
-
-    let mut rdr = Cursor::new(msg);
-    println!("[console] Unwrapping message (len=0x{:x})", len);
-
-    while rdr.position() < len {
-        let cmd = rdr.read_u8().unwrap();
-        match cmd {
-            EVENT_PAYLOADS  => {
-                let size = rdr.read_u8().unwrap();
-                let num = (size - 1) / 0x3;
-                for _ in 0..num {
-                    let k = rdr.read_u8().unwrap();
-                    let l = rdr.read_u16::<BigEndian>().unwrap();
-                    SLIP_CMD.lock().unwrap().insert(k, l);
-                    println!("[console]\tFound command {:x}, len 0x{:x}", k, l);
-                }
-            },
-            GAME_START      => {
-                println!("[console]\tConsumed GAME_START");
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
-            },
-            GAME_END        => {
-                println!("[console]\tConsumed GAME_END");
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
-                res = FLUSH;
-            },
-            PRE_FRAME        => {
-                println!("[console]\tConsumed PRE_FRAME");
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
-            },
-            POST_FRAME        => {
-                println!("[console]\tConsumed POST_FRAME");
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
-            },
-
-            _               => {},
-        };
-    }
-    res
-}
-
 
 
 
@@ -204,17 +127,17 @@ fn main() {
                     total_msgcount += 1;
 
                     // Parse Slippi commands within the message
-                    let msg = parse_message(&message);
+                    let msg = slippi::parse_message(&message);
 
                     // Push a new message onto the global buffer
                     GLOBAL_BUF.lock().unwrap().push(message);
 
                     // Emit a channel message to all consumer threads
                     BUS.lock().unwrap().broadcast(msg);
-                    println!("[console]\t{:?} emit", timestamp());
+                    println!("[console]\t{:?} emit {}", timestamp(), msg);
 
                     match msg {
-                        FLUSH   => {
+                        slippi::GAME_END   => {
                             println!("[console] Going to clear buffer, waiting...");
 
                             // Acquire lock, get current list of threads
@@ -236,8 +159,6 @@ fn main() {
                         },
                         _       => {},
                     };
-
-
                 } 
             }
         }
@@ -269,6 +190,7 @@ fn main() {
 
                 // We wait off-CPU here until we get a channel message
                 let state = rx.recv().unwrap();
+                println!("[{}]\t{:?} got {}", threadname, timestamp(), state);
 
                 // Block until we acquire the lock and unwrap the buffer
                 let buffer = GLOBAL_BUF.lock().unwrap();
@@ -289,7 +211,7 @@ fn main() {
                 println!("[{}]\t{:?} cursor synced", threadname, timestamp());
 
                 match state {
-                    FLUSH       => {
+                    slippi::GAME_END    => {
                         tx.send(tid).unwrap();
                         read_cur = 0;
                         println!("[{}]\tReset local cursor", threadname);
