@@ -70,13 +70,15 @@ lazy_static! {
     static ref THREAD_LIST: Mutex<Vec<usize>> = Mutex::new(vec![]);
 }
 
+// Channel from console thread to N consumer threads
+lazy_static! {
+    static ref BUS: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
+}
+
 
 fn parse_message(msg: &Vec<u8>) -> usize {
     let mut res = UPDATE;
     let len = msg.len() as u64;
-
-    // Note that, we can't ignore HELO messages and *must* pass them through
-    // to clients (otherwise say, the desktop app would time us out).
 
     let mut rdr = Cursor::new(msg);
     println!("[console] Unwrapping message (len=0x{:x})", len);
@@ -124,6 +126,7 @@ fn parse_message(msg: &Vec<u8>) -> usize {
 
 
 
+
 fn main() {
 
     // Handle command-line arguments from the user
@@ -135,28 +138,22 @@ fn main() {
         exit(-1); 
     };
 
-
     // Set up a poll handle and container for polling events
     let poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(1024);
 
-    // Use the 'bus' crate to broadcast on channels; we need to serialize any
-    // access to this because broadcast() and add_rx() require ownership
-    let bus: Arc<Mutex<Bus<usize>>> = Arc::new(Mutex::new(Bus::new(UPDATE)));
+    // Consumer thread ID, used later
+    let mut tid = 0;
 
+    // Channel from N consumer threads to the console thread
     let (m_tx, m_rx) = mpsc::sync_channel(0);
 
-
-/* Set up the console stream and register with Poll. The connect() call here 
- * is implemented in mio (non-blocking), so an immediate HUP should indicate 
- * if we failed to connect (and should proceed to just terminate the program).
- */
     // Connect to the console stream
     let addr: SocketAddr = host.parse().unwrap();
     let mut console_stream = match TcpStream::connect(&addr) {
         Ok(console_stream) => console_stream,
         Err(y) => {
-            panic!("{}", y);
+            panic!("[main]\t{}", y);
         },
     };
 
@@ -174,21 +171,8 @@ fn main() {
     }
 
 
-/* Spawn a thread for handling the console stream, which does the following:
- *
- *  - If a socket is readable:
- *      - Check if the console HUP'ed; die if this is the case
- *      - Read some amount of data from socket into a vector
- *      - Acquire lock, push vector onto the global buffer
- *      - Broadcast on channel, causing all consumer threads to go on-CPU
- *
- * We expect the console to send new data roughly every ~16ms. Everything else 
- * going on needs to fit nicely into this time-window, otherwise we might end
- * up introducing some extra delay during mirroring.
- */
-    let console_bus = bus.clone();
+    // Closure for the console thread
     let mut total_msgcount = 0;
-
     thread::spawn(move || {
 
         println!("[console]\tStarted console socket!");
@@ -226,7 +210,7 @@ fn main() {
                     GLOBAL_BUF.lock().unwrap().push(message);
 
                     // Emit a channel message to all consumer threads
-                    console_bus.lock().unwrap().broadcast(msg);
+                    BUS.lock().unwrap().broadcast(msg);
                     println!("[console]\t{:?} emit", timestamp());
 
                     match msg {
@@ -260,42 +244,27 @@ fn main() {
     });
 
 
-/* Start a server, then spawn a consumer thread when we accept() some client.
- * A consumer thread behaves like so:
- *
- *  - Go off-CPU until we fetch a message on the channel
- *      - Acquire lock and take access to the buffer
- *      - While our local read cursor is behind the write cursor:
- *          - Fetch a message and send it to the client
- *          - Increment our local read cursor
- *
- * Note that it's _probably_ possible for a client to become very far behind,
- * and somehow take up tons of time in-between frames (which would cause other
- * clients to fall behind, etc). There's probably some better way of dealing
- * with that via interactions between the read cursor and channel messages.
- */
-    let mut tid = 0;
+    // Bind to localhost and spawn a new thread for each client
     let listener = TcpListener::bind("127.0.0.1:666").unwrap();
     for s in listener.incoming() {
 
-        // Increment the thread ID, push onto list, then make a clone of the
-        // thread list (so we can pop an ID off if a client HUPs)
-        tid += 1;
-        THREAD_LIST.lock().unwrap().push(tid);
+        // Increment the thread ID, then add it to the list
+        tid += 1; THREAD_LIST.lock().unwrap().push(tid);
 
-        let threadname = String::from(format!("consumer-{}", tid));
-
-        let mut read_cur = 0;
-        let mut rx = bus.lock().unwrap().add_rx();
-        let mut stream = TcpStream::from_stream(s.unwrap()).unwrap();
-
+        // Set up channels for the new thread
+        let mut rx = BUS.lock().unwrap().add_rx();
         let tx = m_tx.clone();
 
-        // Use TCP_NODELAY - probably required to *go fast*
+        // Unwrap/setup the stream managed by the new thread
+        let mut stream = TcpStream::from_stream(s.unwrap()).unwrap();
         stream.set_nodelay(true).unwrap();
 
+        // This is the closure for consumer threads
         thread::spawn(move || {
+            let mut read_cur = 0;
+            let threadname = String::from(format!("consumer-{}", tid));
             println!("[{}] Thread spawned for consumer", threadname);
+
             'consumer_loop: loop {
 
                 // We wait off-CPU here until we get a channel message
@@ -312,9 +281,6 @@ fn main() {
                         Err(y) => {
                             println!("[{}]\tDisconnected ({})", threadname, y);
                             THREAD_LIST.lock().unwrap().retain(|x| x != &tid);
-                            println!("[{}] new threadlist: {:?}",
-                                     threadname, 
-                                     THREAD_LIST.lock().unwrap().iter());
                             break 'consumer_loop;
                         },
                     };
@@ -326,12 +292,10 @@ fn main() {
                     FLUSH       => {
                         tx.send(tid).unwrap();
                         read_cur = 0;
-                        println!("[{}]\tSent all-clear to console thread",
-                                 threadname);
+                        println!("[{}]\tReset local cursor", threadname);
                     },
                     _           => {},
                 };
-
             }
         });
     }
