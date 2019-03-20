@@ -7,7 +7,8 @@ extern crate byteorder;
 extern crate lazy_static;
 
 use std::env;
-use std::process::{exit};
+use std::process;
+use std::time::Duration;
 
 use std::io::prelude::*;
 use std::io::ErrorKind;
@@ -17,7 +18,6 @@ use mio::net::TcpStream;
 use std::net::{TcpListener, SocketAddr};
 
 use std::thread;
-use std::time::Duration;
 use std::sync::{Arc,Mutex};
 use std::sync::mpsc;
 use bus::Bus;
@@ -26,81 +26,69 @@ mod slippi;
 
 const MAIN_THREAD_CYCLE: Duration = Duration::from_millis(10);
 
-// Helper function for timing
+/// Address and port for the server to bind to.
+static SRV: &str = "127.0.0.1:666";
+
+/// Helper function for timing.
 fn timestamp() -> f64 {
     let timespec = time::get_time();
     let mills: f64 = timespec.sec as f64 + (timespec.nsec as f64 / 1000.0 / 1000.0 / 1000.0);
     mills
 }
 
-// Set up a global buffer for messages from console
+/// A global buffer for messages from console.
+/// Mutable access to this buffer must be serialized with a Mutex.
 lazy_static! {
     static ref GLOBAL_BUF: Mutex<Vec<Vec<u8>>> = Mutex::new(vec![vec![]]);
 }
 
-// Set up a global list of consumer threads 
+/// A global list of all running consumer threads.
+/// Mutable access to this list must be serialized with a Mutex.
 lazy_static! {
-    static ref THREAD_LIST: Mutex<Vec<usize>> = Mutex::new(vec![]);
+    static ref CONSUMER_LIST: Mutex<Vec<usize>> = Mutex::new(vec![]);
 }
 
-// Channel from console thread to N consumer threads
+/// A channel from the list thread to N consumer threads.
+/// Mutable access to this object must be serialized with a Mutex.
 lazy_static! {
-    static ref BUS: Arc<Mutex<Bus<u8>>> = Arc::new(Mutex::new(Bus::new(32)));
+    static ref CONSUMER_BUS: Arc<Mutex<Bus<u8>>> = Arc::new(Mutex::new(Bus::new(32)));
 }
 
 
+/// Spawn the 'console thread,' for receiving data from a console.
+/// 'SocketAddr' is the address::port of the remote host.
+/// 'rx' is the mpsc::Receiver<usize> end of an mpsc channel.
+/// 
+/// If a connection to the remote host can't be established, this function
+/// will terminate the program with return code -1.
+fn spawn_console_thread(addr: SocketAddr, rx: mpsc::Receiver<usize>) {
 
-fn main() {
-
-    // Handle command-line arguments from the user
-    let args: Vec<String> = env::args().collect();
-    let host: String = if args.len() >= 2 {
-        String::from(format!("{}:{}", &args[1], 666))
-    } else { 
-        println!("usage: andross <console IP address>"); 
-        exit(-1); 
-    };
-
-    // Set up a poll handle and container for polling events
+    // Register objects for handling asynchronous I/O
     let poll = Poll::new().unwrap();
     let mut events = Events::with_capacity(1024);
 
-    // Consumer thread ID, used later
-    let mut tid = 0;
-
-    // Channel from N consumer threads to the console thread
-    let (m_tx, m_rx) = mpsc::sync_channel(0);
-
     // Connect to the console stream
-    let addr: SocketAddr = host.parse().unwrap();
-    let mut console_stream = match TcpStream::connect(&addr) {
-        Ok(console_stream) => console_stream,
-        Err(y) => {
-            panic!("[main]\t{}", y);
-        },
-    };
+    let mut stream = TcpStream::connect(&addr).unwrap(); 
 
     // Register the console stream with poll
-    poll.register(&console_stream, Token(0), Ready::all(), PollOpt::edge()).unwrap();
+    poll.register(&stream, Token(0), Ready::all(), PollOpt::edge())
+        .unwrap();
 
-     // Check if we connected, otherwise die.
+     // Check if we connected, otherwise terminate the program.
     poll.poll(&mut events, None).unwrap();
     for event in &events {
         if event.token() == Token(0) && event.readiness().is_hup() {
             println!("[console]\tCouldn't connect to the console!");
-            console_stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
-            std::process::exit(-1);
+            stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
+            process::exit(-1);
         }
     }
 
-
-    // Closure for the console thread
-    let mut total_msgcount = 0;
     thread::spawn(move || {
-
         println!("[console]\tStarted console socket!");
 
         'console_loop: loop {
+
             poll.poll(&mut events, None).unwrap();
             for event in &events {
 
@@ -109,14 +97,14 @@ fn main() {
 
                     // If the client hung up, break out of this loop
                     if event.readiness().is_hup() {
-                        console_stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
+                        stream.shutdown(mio::tcp::Shutdown::Both).unwrap();
                         println!("[console]\tThe console hung up our connection.");
                         break 'console_loop;
                     }
 
                     // Read the message into a vector
                     let mut message = vec![];
-                    match console_stream.read_to_end(&mut message) {
+                    match stream.read_to_end(&mut message) {
                         Ok(_)   => {},
                         Err(y)  => {
                             if y.kind() != ErrorKind::WouldBlock {
@@ -124,7 +112,6 @@ fn main() {
                             }
                         },
                     };
-                    total_msgcount += 1;
 
                     // Parse Slippi commands within the message
                     let msg = slippi::parse_message(&message);
@@ -133,83 +120,82 @@ fn main() {
                     GLOBAL_BUF.lock().unwrap().push(message);
 
                     // Emit a channel message to all consumer threads
-                    BUS.lock().unwrap().broadcast(msg);
+                    CONSUMER_BUS.lock().unwrap().broadcast(msg);
                     println!("[console]\t{:?} emit {}", timestamp(), msg);
 
                     match msg {
-                        slippi::GAME_END   => {
-                            println!("[console] Going to clear buffer, waiting...");
+                        slippi::GAME_END => {
 
-                            // Acquire lock, get current list of threads
-                            let mut consumers = THREAD_LIST.lock().unwrap().to_vec();
+                            // Acquire lock, make a copy of the thread list
+                            let mut consumers = CONSUMER_LIST.lock().unwrap().to_vec();
 
-                            // Block until all consumers are accounted for
+                            // Block until all consumers have checked in
                             while consumers.len() != 0 {
                                 println!("[console]\tWaiting for {:?}", consumers);
-                                let tid = m_rx.recv().unwrap();
+
+                                let tid = rx.recv().unwrap();
                                 consumers.retain(|x| x != &tid);
                             }
 
-                            // Flush to disk, or something
-                            // <impl here...>
-
-                            // Free up messages from this session
+                            // Free up all messages from this session
                             GLOBAL_BUF.lock().unwrap().clear();
                             println!("[console]\tFlushed memory");
+
                         },
-                        _       => {},
+                        slippi::GAME_START => {
+                            println!("[console]\tGame started");
+                        },
+                        _ => {},
                     };
                 } 
             }
         }
     });
 
+}
 
-    // Bind to localhost and spawn a new thread for each client
-    let listener = TcpListener::bind("127.0.0.1:666").unwrap();
-    for s in listener.incoming() {
 
-        // Increment the thread ID, then add it to the list
-        tid += 1; THREAD_LIST.lock().unwrap().push(tid);
+/// Spawn a 'consumer thread' for sending data to a client.
+/// 'tid' is a unique thread ID.
+/// 'stream' is the client stream managed by this thread.
+/// 'tx' is a clone of the mpsc::SyncSender<usize> end of an mpsc channel.
+fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender<usize>) {
 
-        // Set up channels for the new thread
-        let mut rx = BUS.lock().unwrap().add_rx();
-        let tx = m_tx.clone();
-
-        // Unwrap/setup the stream managed by the new thread
-        let mut stream = TcpStream::from_stream(s.unwrap()).unwrap();
-        stream.set_nodelay(true).unwrap();
-
-        // This is the closure for consumer threads
         thread::spawn(move || {
-            let mut read_cur = 0;
-            let threadname = String::from(format!("consumer-{}", tid));
-            println!("[{}] Thread spawned for consumer", threadname);
 
+            // Put this thread on the list and register ourselves on the bus
+            CONSUMER_LIST.lock().unwrap().push(tid);
+            let mut rx = CONSUMER_BUS.lock().unwrap().add_rx();
+
+            let threadname = format!("consumer-{}", tid);
+            println!("[{}] Consumer thread spawned", threadname);
+
+            let mut read_cur = 0;
             'consumer_loop: loop {
 
-                // We wait off-CPU here until we get a channel message
+                // Wait off-CPU until we get a message
                 let state = rx.recv().unwrap();
-                println!("[{}]\t{:?} got {}", threadname, timestamp(), state);
 
                 // Block until we acquire the lock and unwrap the buffer
                 let buffer = GLOBAL_BUF.lock().unwrap();
                 let write_cur = buffer.len();
 
-                // Read and send() until we catch up to the write cursor
+                // Only send() if our cursor hasn't caught up all-the-way
                 while read_cur < write_cur {
                     match stream.write(buffer.get(read_cur).unwrap()) {
                         Ok(_) => {},
                         Err(y) => {
                             println!("[{}]\tDisconnected ({})", threadname, y);
-                            THREAD_LIST.lock().unwrap().retain(|x| x != &tid);
+                            CONSUMER_LIST.lock().unwrap().retain(|x| x != &tid);
                             break 'consumer_loop;
                         },
                     };
                     read_cur += 1;
                 }
-                println!("[{}]\t{:?} cursor synced", threadname, timestamp());
+                println!("[{}]\t{:?} Flushed to client", threadname, timestamp());
 
+                // If the next batch of messages contains a GAME_END, tell the
+                // console thread when we've finished sending to the client.
                 match state {
                     slippi::GAME_END    => {
                         tx.send(tid).unwrap();
@@ -220,8 +206,44 @@ fn main() {
                 };
             }
         });
+}
+
+
+/// The main loop. Dispatches a thread for managing data from console, and
+/// then, dispatches a consumer thread whenever a client connects.
+fn main() {
+
+    // Handle command-line arguments from the user
+    let args: Vec<String> = env::args().collect();
+    let host: String = if args.len() >= 2 {
+        String::from(format!("{}:{}", &args[1], 666))
+    } else { 
+        println!("usage: andross <console IP address>"); 
+        process::exit(-1); 
+    };
+
+    // Create the console thread
+    let addr: SocketAddr = host.parse().unwrap();
+    let (m_tx, m_rx) = mpsc::sync_channel(0);
+    spawn_console_thread(addr, m_rx);
+
+    let server = TcpListener::bind(SRV).unwrap();
+    let mut tid = 1;
+
+    // Waits until we accept() a new client
+    for s in server.incoming() {
+
+        let stream = TcpStream::from_stream(s.unwrap()).unwrap();
+        stream.set_nodelay(true).unwrap();
+
+        // Create a consumer thread
+        spawn_consumer_thread(tid, stream, m_tx.clone());
+
+        tid += 1; 
     }
 
     // Let the main thread just wait around, for now
     loop { thread::sleep(MAIN_THREAD_CYCLE); }
 }
+
+

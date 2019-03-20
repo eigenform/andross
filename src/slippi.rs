@@ -1,4 +1,3 @@
-
 use std::io::prelude::*;
 use std::io::Cursor;
 use std::io::SeekFrom;
@@ -7,7 +6,9 @@ use byteorder::{ReadBytesExt, BigEndian};
 use std::sync::Mutex;
 use std::collections::HashMap;
 
-// Global HashMap, mapping Slippi commands to their sizes.
+
+/// A global hash map, mapping Slippi commands to their sizes.
+/// Mutable access to the map must be serialized with a Mutex.
 lazy_static! {
     static ref SLIP_CMD: Mutex<HashMap<u8, u16>> = Mutex::new({
         let mut m = HashMap::new();
@@ -25,6 +26,7 @@ pub const GAME_START: u8        = 0x36;
 pub const PRE_FRAME: u8         = 0x37; 
 pub const POST_FRAME: u8        = 0x38; 
 pub const GAME_END: u8          = 0x39; 
+
 
 /// Parses a packet with Slippi data. The packet may contain multiple Slippi
 /// messages/commands. 
@@ -53,6 +55,7 @@ pub fn parse_message(msg: &Vec<u8>) -> u8 {
             GAME_START => {
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
                 rdr.seek(SeekFrom::Current(mlen)).unwrap();
+                res = GAME_START;
             },
             GAME_END => {
                 let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
