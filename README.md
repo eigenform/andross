@@ -1,6 +1,14 @@
 # andross
 An [experimental] Project Slippi client/relay, written in Rust!
 
+## TODO 
+
+- Flush console data for a session to a `.slp` file on disk 
+- Clean up buffers in-between sessions and reset consumer threads
+- Devise some nice way to handle client/console disconnect
+- Go faster, optimize timing, etc.
+- Expose some interface for sending real-time, "higher-level" messages to clients?
+
 
 ## Implementation Notes
 I haven't written a lot of Rust, so I feel compelled to have some _very pedantic_
