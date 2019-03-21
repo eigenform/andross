@@ -51,25 +51,86 @@ pub fn parse_message(msg: &Vec<u8>) -> u8 {
                 }
             }
             GAME_START => {
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
+                parse_game_start(&mut rdr);
                 res = GAME_START;
             }
             GAME_END => {
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
+                parse_game_end(&mut rdr);
                 res = GAME_END;
             }
             PRE_FRAME => {
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
+                parse_pre_frame(&mut rdr);
             }
             POST_FRAME => {
-                let mlen = *SLIP_CMD.lock().unwrap().get(&cmd).unwrap() as i64;
-                rdr.seek(SeekFrom::Current(mlen)).unwrap();
+                parse_post_frame(&mut rdr);
             }
             _ => {}
         };
     }
     res
+}
+
+
+fn parse_game_start(buf: &mut Cursor<&Vec<u8>>) {
+    let mlen = *SLIP_CMD.lock().unwrap().get(&GAME_START).unwrap() as i64;
+
+    // ...
+
+    buf.seek(SeekFrom::Current(mlen)).unwrap();
+}
+
+fn parse_game_end(buf: &mut Cursor<&Vec<u8>>) {
+    let mlen = *SLIP_CMD.lock().unwrap().get(&GAME_END).unwrap() as i64;
+
+    //let gameEndMethod = buf.read_u8().unwrap();
+
+    buf.seek(SeekFrom::Current(mlen)).unwrap();
+}
+
+fn parse_pre_frame(buf: &mut Cursor<&Vec<u8>>) {
+    let mlen = *SLIP_CMD.lock().unwrap().get(&PRE_FRAME).unwrap() as i64;
+
+    //let frame = buf.read_i32::<BigEndian>().unwrap();
+    //let playerIndex = buf.read_u8().unwrap();
+    //let isFollower = buf.read_u8().unwrap();
+    //let seed = buf.read_u32::<BigEndian>().unwrap();
+    //let actionState = buf.read_u16::<BigEndian>().unwrap();
+    //let positionX = buf.read_f32::<BigEndian>().unwrap();
+    //let positionY = buf.read_f32::<BigEndian>().unwrap();
+    //let facingDirection = buf.read_f32::<BigEndian>().unwrap();
+    //let joystickX = buf.read_f32::<BigEndian>().unwrap();
+    //let joystickY = buf.read_f32::<BigEndian>().unwrap();
+    //let cStickX = buf.read_f32::<BigEndian>().unwrap();
+    //let cStickY = buf.read_f32::<BigEndian>().unwrap();
+    //let trigger = buf.read_f32::<BigEndian>().unwrap();
+    //let buttons = buf.read_u32::<BigEndian>().unwrap();
+    //let physicalButtons = buf.read_u16::<BigEndian>().unwrap();
+    //let physicalLTrigger = buf.read_f32::<BigEndian>().unwrap();
+    //let physicalRTrigger = buf.read_f32::<BigEndian>().unwrap();
+    //let rawJoystickX = buf.read_u8().unwrap();
+    //let percent = buf.read_f32::<BigEndian>().unwrap();
+
+    buf.seek(SeekFrom::Current(mlen)).unwrap();
+}
+
+fn parse_post_frame(buf: &mut Cursor<&Vec<u8>>) {
+    let mlen = *SLIP_CMD.lock().unwrap().get(&POST_FRAME).unwrap() as i64;
+
+    //let frame = buf.read_i32::<BigEndian>().unwrap();
+    //let playerIndex = buf.read_u8().unwrap();
+    //let isFollower = buf.read_u8().unwrap();
+    //let internalCharID = buf.read_u8().unwrap();
+    //let actionState = buf.read_u16::<BigEndian>().unwrap();
+    //let positionX = buf.read_f32::<BigEndian>().unwrap();
+    //let positionY = buf.read_f32::<BigEndian>().unwrap();
+    //let facingDirection = buf.read_f32::<BigEndian>().unwrap();
+    //let percent = buf.read_f32::<BigEndian>().unwrap();
+    //let shieldSize = buf.read_f32::<BigEndian>().unwrap();
+    //let lastAttackLanded = buf.read_u8().unwrap();
+    //let currentComboCount = buf.read_u8().unwrap();
+    //let lastHitBy = buf.read_u8().unwrap();
+    //let stocksRemaining = buf.read_u8().unwrap();
+    //let actionStateCounter = buf.read_f32::<BigEndian>().unwrap();
+
+    buf.seek(SeekFrom::Current(mlen)).unwrap();
 }
