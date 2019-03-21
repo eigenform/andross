@@ -36,8 +36,6 @@ pub fn parse_message(msg: &Vec<u8>) -> u8 {
     let len = msg.len() as u64;
 
     let mut rdr = Cursor::new(msg);
-    println!("[console] Unwrapping message (len=0x{:x})", len);
-
     while rdr.position() < len {
         let cmd = rdr.read_u8().unwrap();
         match cmd {
@@ -69,7 +67,6 @@ pub fn parse_message(msg: &Vec<u8>) -> u8 {
     }
     res
 }
-
 
 fn parse_game_start(buf: &mut Cursor<&Vec<u8>>) {
     let mlen = *SLIP_CMD.lock().unwrap().get(&GAME_START).unwrap() as i64;

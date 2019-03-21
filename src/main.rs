@@ -26,9 +26,6 @@ mod slippi;
 
 const MAIN_THREAD_CYCLE: Duration = Duration::from_millis(10);
 
-/// Address and port for the server to bind to.
-static SRV: &str = "127.0.0.1:666";
-
 /// Helper function for timing.
 fn timestamp() -> f64 {
     let timespec = time::get_time();
@@ -116,7 +113,7 @@ fn spawn_console_thread(addr: SocketAddr, rx: mpsc::Receiver<usize>) {
 
                     // Emit a channel message to all consumer threads
                     CONSUMER_BUS.lock().unwrap().broadcast(msg);
-                    println!("[console]\t{:?} emit {}", timestamp(), msg);
+                    //println!("[console]\t{:?} emit {}", timestamp(), msg);
 
                     match msg {
                         slippi::GAME_END => {
@@ -125,7 +122,7 @@ fn spawn_console_thread(addr: SocketAddr, rx: mpsc::Receiver<usize>) {
 
                             // Block until all consumers have checked in
                             while consumers.len() != 0 {
-                                println!("[console]\tWaiting for {:?}", consumers);
+                                //println!("[console]\tWaiting for {:?}", consumers);
 
                                 let tid = rx.recv().unwrap();
                                 consumers.retain(|x| x != &tid);
@@ -157,7 +154,7 @@ fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender
         let mut rx = CONSUMER_BUS.lock().unwrap().add_rx();
 
         let threadname = format!("consumer-{}", tid);
-        println!("[{}] Consumer thread spawned", threadname);
+        println!("[{}]\tConsumer thread spawned", threadname);
 
         let mut read_cur = 0;
         'consumer_loop: loop {
@@ -180,7 +177,7 @@ fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender
                 };
                 read_cur += 1;
             }
-            println!("[{}]\t{:?} Flushed to client", threadname, timestamp());
+            //println!("[{}]\t{:?} Flushed to client", threadname, timestamp());
 
             // If the next batch of messages contains a GAME_END, tell the
             // console thread when we've finished sending to the client.
@@ -213,19 +210,25 @@ fn main() {
     let (m_tx, m_rx) = mpsc::sync_channel(0);
     spawn_console_thread(addr, m_rx);
 
-    let server = TcpListener::bind(SRV).unwrap();
-    let mut tid = 1;
+    // Create the relay thread
+    thread::spawn(move || {
+        let server = TcpListener::bind("127.0.0.1:666").unwrap();
+        let mut tid = 1;
 
-    // Waits until we accept() a new client
-    for s in server.incoming() {
-        let stream = TcpStream::from_stream(s.unwrap()).unwrap();
-        stream.set_nodelay(true).unwrap();
+        println!("[relay]\t\tListening on 127.0.0.1:666");
 
-        // Create a consumer thread
-        spawn_consumer_thread(tid, stream, m_tx.clone());
+        // Wait in a loop until we accept() a new client
+        for s in server.incoming() {
+            let stream = TcpStream::from_stream(s.unwrap()).unwrap();
+            stream.set_nodelay(true).unwrap();
 
-        tid += 1;
-    }
+            // Spawn a consumer client thread to handle this client
+            println!("[relay]\t\tCreating new thread for client");
+            spawn_consumer_thread(tid, stream, m_tx.clone());
+
+            tid += 1;
+        }
+    });
 
     // Let the main thread just wait around, for now
     loop {
