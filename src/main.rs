@@ -2,11 +2,11 @@ extern crate bus;
 extern crate byteorder;
 extern crate mio;
 extern crate time;
+extern crate clap;
 
 #[macro_use]
 extern crate lazy_static;
 
-use std::env;
 use std::process;
 use std::time::Duration;
 
@@ -21,6 +21,8 @@ use bus::Bus;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use clap::{Arg, App};
 
 mod slippi;
 
@@ -113,7 +115,6 @@ fn spawn_console_thread(addr: SocketAddr, rx: mpsc::Receiver<usize>) {
 
                     // Emit a channel message to all consumer threads
                     CONSUMER_BUS.lock().unwrap().broadcast(msg);
-                    //println!("[console]\t{:?} emit {}", timestamp(), msg);
 
                     match msg {
                         slippi::GAME_END => {
@@ -122,15 +123,13 @@ fn spawn_console_thread(addr: SocketAddr, rx: mpsc::Receiver<usize>) {
 
                             // Block until all consumers have checked in
                             while consumers.len() != 0 {
-                                //println!("[console]\tWaiting for {:?}", consumers);
-
                                 let tid = rx.recv().unwrap();
                                 consumers.retain(|x| x != &tid);
                             }
 
                             // Free up all messages from this session
                             GLOBAL_BUF.lock().unwrap().clear();
-                            println!("[console]\tFlushed memory");
+                            println!("[console]\tFlushed memory from session");
                         }
                         slippi::GAME_START => {
                             println!("[console]\tGame started");
@@ -153,11 +152,14 @@ fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender
         CONSUMER_LIST.lock().unwrap().push(tid);
         let mut rx = CONSUMER_BUS.lock().unwrap().add_rx();
 
+        // Keep a thread-local read cursor (unique to the client)
+        let mut read_cur = 0;
+
         let threadname = format!("consumer-{}", tid);
         println!("[{}]\tConsumer thread spawned", threadname);
 
-        let mut read_cur = 0;
         'consumer_loop: loop {
+
             // Wait off-CPU until we get a message
             let state = rx.recv().unwrap();
 
@@ -165,19 +167,28 @@ fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender
             let buffer = GLOBAL_BUF.lock().unwrap();
             let write_cur = buffer.len();
 
-            // Only send() if our cursor hasn't caught up all-the-way
+            // Send messages until we are synchronized with the write cursor
             while read_cur < write_cur {
                 match stream.write(buffer.get(read_cur).unwrap()) {
-                    Ok(_) => {}
+
+                    // Increment the cursor when we successfully send()
+                    Ok(_) => {
+                        read_cur += 1;
+                    },
+
                     Err(y) => {
-                        println!("[{}]\tDisconnected ({})", threadname, y);
-                        CONSUMER_LIST.lock().unwrap().retain(|x| x != &tid);
-                        break 'consumer_loop;
+                        println!("[{}]\tError kind: {:?}", threadname, y.kind());
+
+                        // Remove this thread from the list and terminate
+                        if y.kind() == ErrorKind::BrokenPipe {
+                            println!("[{}]\tClient disconnected", threadname);
+                            CONSUMER_LIST.lock().unwrap().retain(|x| x != &tid);
+                            break 'consumer_loop;
+                        }
+                        //if (y.kind() == ErrorKind::WouldBlock) ...
                     }
                 };
-                read_cur += 1;
             }
-            //println!("[{}]\t{:?} Flushed to client", threadname, timestamp());
 
             // If the next batch of messages contains a GAME_END, tell the
             // console thread when we've finished sending to the client.
@@ -190,32 +201,62 @@ fn spawn_consumer_thread(tid: usize, mut stream: TcpStream, tx: mpsc::SyncSender
                 _ => {}
             };
         }
+        println!("[{}]\tConsumer thread exited", threadname);
     });
 }
 
 /// The main loop. Dispatches a thread for managing data from console, and
 /// then, dispatches a consumer thread whenever a client connects.
 fn main() {
-    // Handle command-line arguments from the user
-    let args: Vec<String> = env::args().collect();
-    let host: String = if args.len() >= 2 {
-        String::from(format!("{}:{}", &args[1], 666))
-    } else {
-        println!("usage: andross <console IP address>");
-        process::exit(-1);
-    };
+    let matches = App::new("andross")
+        .version("0.1.0")
+        .about("A relay for mirroring with Project Slippi, written in Rust!\n
+        The server binds to tcp/666 by default, so you may need adequate
+        permissions unless you select a different port number.")
+        .arg(Arg::with_name("host")
+            .help("IP address of the ingress data stream.")
+            .required(true))
+        .arg(Arg::with_name("port")
+             .help("TCP port of the ingress data stream.\n(default=666)")
+             .short("P")
+             .takes_value(true)
+             .long("port"))
+        .arg(Arg::with_name("server-ip")
+             .help("Starts the server on the given IP address.\n(default=127.0.0.1)")
+             .takes_value(true)
+             .short("l")
+             .long("server-ip"))
+        .arg(Arg::with_name("server-port")
+             .help("Binds the server on the given TCP port.\n(default=666)")
+             .short("p")
+             .takes_value(true)
+             .long("server-port"))
+        .arg(Arg::with_name("max-conn")
+             .help("Sets the maximum number of concurrent connections.\n(default=Unlimited)")
+             .short("M")
+             .takes_value(true)
+             .long("client-limit")
+        ).get_matches();
+
+    let c_host = matches.value_of("host").unwrap();
+    let c_port = matches.value_of("port").unwrap_or("666");
+    let c_addr: String = String::from(format!("{}:{}", c_host, c_port));
+
+    let s_host = matches.value_of("server-ip").unwrap_or("127.0.0.1");
+    let s_port = matches.value_of("server-port").unwrap_or("666");
+    let s_addr: String = String::from(format!("{}:{}", s_host, s_port));
 
     // Create the console thread
-    let addr: SocketAddr = host.parse().unwrap();
+    let addr: SocketAddr = c_addr.parse().unwrap();
     let (m_tx, m_rx) = mpsc::sync_channel(0);
     spawn_console_thread(addr, m_rx);
 
-    // Create the relay thread
+    // Create the relay server thread
     thread::spawn(move || {
-        let server = TcpListener::bind("127.0.0.1:666").unwrap();
+        let server = TcpListener::bind(&s_addr).unwrap();
         let mut tid = 1;
 
-        println!("[relay]\t\tListening on 127.0.0.1:666");
+        println!("[relay]\t\tListening on {}", &s_addr);
 
         // Wait in a loop until we accept() a new client
         for s in server.incoming() {
